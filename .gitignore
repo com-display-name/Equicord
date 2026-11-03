@@ -33,6 +33,8 @@ ExtensionCache/
 # vencord companion module cache
 .modules
 
+dev*.*
+
 # wakatime related stuff
 .wakatime-project
 
