@@ -7,11 +7,13 @@
 import { findGroupChildrenByChildId, NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { updateMessage } from "@api/MessageUpdater";
 import { definePluginSettings } from "@api/Settings";
+import ErrorBoundary from "@components/ErrorBoundary";
 import { PencilIcon, ResetIcon } from "@components/Icons";
 import { EquicordDevs } from "@utils/constants";
 import definePlugin, { OptionType } from "@utils/types";
-import { Channel, Message } from "@vencord/discord-types";
-import { ChannelStore, Menu, MessageActions, MessageStore, UserStore } from "@webpack/common";
+import { Channel, Message, RenderModalProps } from "@vencord/discord-types";
+import { findByPropsLazy } from "@webpack";
+import { ChannelStore, Menu, MessageActions, MessageStore, Modal, openModal, SelectedChannelStore, TextArea, UserStore, useState } from "@webpack/common";
 
 interface LocalEdit {
     channelId: string;
@@ -22,22 +24,18 @@ interface LocalEdit {
 
 const localEdits = new Map<string, LocalEdit>();
 
-// Returns the stored edit, capturing the pre-edit originals on first local change
-function ensureStored(message: Message, channelId: string): LocalEdit {
-    let stored = localEdits.get(message.id);
-    if (!stored) {
-        stored = {
-            channelId,
-            originalContent: message.content ?? "",
-            originalEditedTimestamp: message.editedTimestamp ?? null,
-            newContent: message.content ?? ""
-        };
-        localEdits.set(message.id, stored);
-    }
-    return stored;
-}
+// Discord's EDIT chat input type requires SEND_MESSAGES by default, even though
+// it only edits a message. Relax that check while the plugin is enabled so the
+// native edit box also opens in read-only channels.
+const ChatInputTypes = findByPropsLazy("FORM", "NORMAL");
+let originalEditRequireSendMessages: boolean | undefined;
 
 const settings = definePluginSettings({
+    useNativeEditBox: {
+        type: OptionType.BOOLEAN,
+        description: "Use Discord's default edit box instead of a modal. This also works in channels where you cannot send messages",
+        default: true
+    },
     showResetOption: {
         type: OptionType.BOOLEAN,
         description: "Show a \"Reset Edited Message\" option to restore the original content of locally edited messages",
@@ -59,8 +57,93 @@ function getDisplayContent(message: Message): string {
     return localEdits.get(message.id)?.newContent ?? message.content ?? "";
 }
 
+function applyLocalEdit(message: Message, channelId: string, newContent: string) {
+    const stored = localEdits.get(message.id);
+    const originalContent = stored?.originalContent ?? message.content ?? "";
+    const originalEditedTimestamp = stored?.originalEditedTimestamp ?? message.editedTimestamp ?? null;
+
+    // Setting the text back to the original content removes the local edit
+    if (newContent === originalContent) {
+        if (stored) {
+            localEdits.delete(message.id);
+            updateMessage(channelId, message.id, {
+                content: originalContent,
+                editedTimestamp: originalEditedTimestamp
+            });
+        }
+        return;
+    }
+
+    const edit = stored ?? {
+        channelId,
+        originalContent,
+        originalEditedTimestamp,
+        newContent
+    };
+
+    edit.newContent = newContent;
+    localEdits.set(message.id, edit);
+
+    updateMessage(channelId, message.id, {
+        content: newContent,
+        editedTimestamp: editedTimestampFor(edit)
+    });
+}
+
+function EditMessageModal({ modalProps, message, channel }: { modalProps: RenderModalProps; message: Message; channel: Channel; }) {
+    const [content, setContent] = useState(getDisplayContent(message));
+
+    return (
+        <Modal
+            {...modalProps}
+            size="md"
+            title="Edit Message (Local)"
+            subtitle="This edit is only visible to you and is reverted on relaunch."
+            actions={[
+                { text: "Cancel", variant: "secondary", onClick: modalProps.onClose },
+                {
+                    text: "Save",
+                    variant: "primary",
+                    onClick: () => {
+                        applyLocalEdit(message, channel.id, content);
+                        modalProps.onClose();
+                    }
+                }
+            ]}
+        >
+            <TextArea
+                value={content}
+                onChange={setContent}
+                placeholder="Message content"
+                autosize
+                autoFocus
+            />
+        </Modal>
+    );
+}
+
+function enableNativeEditBoxInReadOnlyChannels() {
+    const editType = ChatInputTypes.EDIT;
+    if (editType?.permissions) {
+        originalEditRequireSendMessages ??= editType.permissions.requireSendMessages;
+        editType.permissions.requireSendMessages = false;
+    }
+}
+
 function startEditing(message: Message, channel: Channel) {
-    MessageActions.startEditMessage(channel.id, message.id, getDisplayContent(message));
+    // The native edit box only exists for the currently selected channel. If the
+    // message is from somewhere else (e.g. a search result), use the modal.
+    if (settings.store.useNativeEditBox && SelectedChannelStore.getChannelId() === channel.id) {
+        enableNativeEditBoxInReadOnlyChannels();
+        MessageActions.startEditMessage(channel.id, message.id, getDisplayContent(message));
+        return;
+    }
+
+    openModal(modalProps => (
+        <ErrorBoundary>
+            <EditMessageModal modalProps={modalProps} message={message} channel={channel} />
+        </ErrorBoundary>
+    ));
 }
 
 function resetEdit(channelId: string, messageId: string) {
@@ -75,27 +158,6 @@ function resetEdit(channelId: string, messageId: string) {
 
 function editedTimestampFor(stored: LocalEdit): Date | null {
     return settings.store.showEditedTag ? new Date() : stored.originalEditedTimestamp;
-}
-
-function closeEditBox() {
-    const active = document.activeElement;
-    const target = (active && active !== document.body
-        ? active
-        : document.querySelector("[data-slate-editor=true]")) as HTMLElement | null;
-    if (!target) return;
-
-    const ev = new KeyboardEvent("keydown", {
-        key: "Escape",
-        code: "Escape",
-        bubbles: true,
-        cancelable: true
-    });
-    // Some handlers check the legacy props
-    Object.defineProperties(ev, {
-        keyCode: { value: 27 },
-        which: { value: 27 }
-    });
-    target.dispatchEvent(ev);
 }
 
 const messageContextMenuPatch: NavContextMenuPatchCallback = (children, props) => {
@@ -120,7 +182,7 @@ const messageContextMenuPatch: NavContextMenuPatchCallback = (children, props) =
         <Menu.MenuItem
             id="edit-other-message"
             key="edit-other-message"
-            label={isOwn ? "Edit Message (Local)" : "Edit Message"}
+            label="Edit Message (Local)"
             icon={PencilIcon}
             leadingAccessory={{ type: "icon", icon: PencilIcon }}
             action={() => startEditing(message, channel)}
@@ -170,7 +232,7 @@ export default definePlugin({
     name: "EditOtherPeopleMessages",
     description: "Edit other people's messages locally (reverted on relaunch)",
     tags: ["Chat", "Utility"],
-    authors: [EquicordDevs.displayname],
+    authors: [EquicordDevs.n71],
     settings,
     dependencies: ["MessageUpdaterAPI", "MessagePopoverAPI"],
 
@@ -194,7 +256,7 @@ export default definePlugin({
             if (!channel) return null;
 
             return {
-                label: isOwn ? "Edit Message (Local)" : "Edit Message",
+                label: "Edit Message (Local)",
                 icon: PencilIcon,
                 message,
                 channel,
@@ -225,29 +287,22 @@ export default definePlugin({
         // Let real edits of your own messages go through normally
         if (message.author?.id === meId) return;
 
-        const newContent = messageObj.content ?? "";
-        const stored = ensureStored(message, channelId);
-        const currentContent = stored.newContent ?? message.content ?? "";
+        applyLocalEdit(message, channelId, messageObj.content ?? "");
 
-        // No change, just exit edit mode without an API call
-        if (newContent === currentContent) return { cancel: true };
-
-        stored.newContent = newContent;
-
-        updateMessage(channelId, messageId, {
-            content: newContent,
-            editedTimestamp: editedTimestampFor(stored)
-        });
-
-        // Cancelling the edit makes MessageEventsAPI return {shouldClear:false},
-        // which leaves the native edit box open. Close it the same way pressing
-        // Escape would, after the box has refocused.
-        setTimeout(closeEditBox, 50);
+        // Cancel the API request. Discord leaves the edit box open on a cancelled
+        // edit, so close it again after the submit handler has finished.
+        setTimeout(() => MessageActions.endEditMessage(channelId), 0);
 
         return { cancel: true };
     },
 
     stop() {
+        // Restore the original permission check
+        if (originalEditRequireSendMessages !== undefined) {
+            ChatInputTypes.EDIT.permissions.requireSendMessages = originalEditRequireSendMessages;
+            originalEditRequireSendMessages = undefined;
+        }
+
         // Restore original contents
         for (const [messageId, edit] of [...localEdits]) {
             resetEdit(edit.channelId, messageId);

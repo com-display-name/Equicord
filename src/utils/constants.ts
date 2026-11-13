@@ -1510,6 +1510,10 @@ export const EquicordDevs = Object.freeze({
     ShaunLWM: {
         name: "sprxsheep",
         id: 130964561900732416n,
+    },
+    n71: {
+        name: "0n71",
+        id: 938892212584996937n
     }
 } satisfies Record<string, Dev>);
 
